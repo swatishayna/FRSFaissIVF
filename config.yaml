@@ -1,0 +1,49 @@
+faiss:
+  dim: 512       # embedding dimension
+  nlist: 1000    # number of coarse clusters
+  m: 16          # number of subquantizers
+  nbits: 8       # bits per subvector
+  nprobe: 10     # number of clusters to search
+
+
+logging:
+  file: "logs/app.log"
+  level: "INFO"
+
+
+
+face_model: "buffalo_l"
+threshold: 0.7
+
+
+# ----------------------------
+# Database Configuration
+# ----------------------------
+
+db:
+  host: "172.27.1.101"
+  user: root
+  password: "Root@321*"
+  database: "cctns_state_db"
+  port: 3306
+  query: |
+    SELECT
+    taf.ACCUSED_FILE_SRNO AS FILE_SRNO,
+    tai.ACCUSED_SRNO,
+    taf.FILE_NAME,
+    CONCAT(tai.FIRST_NAME, ' ', tai.LAST_NAME) AS ACCUSED_NAME,
+    tai.RELATIVE_NAME,tai.AGE,
+    mg.GENDER,
+    CONCAT(SUBSTR(tfr.FIR_REG_NUM, -4), '/', tfr.REG_YEAR) AS FIR_REG_NUM,tai.AGE,tai.YOB,
+    d.DISTRICT , p.PS ,
+    taf.UPLOADED_FILE
+    FROM t_accused_info tai
+    LEFT JOIN t_fir_registration tfr ON tai.fir_reg_num = tfr.fir_reg_num AND tfr.LANG_CD=6 AND tfr.RECORD_STATUS <>'D'  
+    LEFT JOIN t_accused_files taf ON taf.ACCUSED_SRNO = tai.ACCUSED_SRNO
+    LEFT JOIN m_gender mg ON tai.GENDER_CD = mg.GENDER_CD AND mg.LANG_CD= 6
+    LEFT JOIN m_district d ON tfr.DISTRICT_CD = d.DISTRICT_CD AND d.LANG_CD = 6
+    LEFT JOIN m_police_station p ON tfr.PS_CD = p.PS_CD AND p.LANG_CD = 6 
+    WHERE taf.UPLOADED_FILE IS NOT NULL
+    
+
+

@@ -131,11 +131,6 @@ def get_total_row_count():
         if conn:
             conn.close()
 
-
-
-
-
-
 def save_n_images_from_db(n=10, output_dir="image/mysqldata/images"):
     """
     Fetches 'n' images using existing db_utils functions and saves them as .jpg files.
@@ -176,8 +171,6 @@ def save_n_images_from_db(n=10, output_dir="image/mysqldata/images"):
     conn.close()
     print("🔌 Database connection closed.")
 
-
-
 def fetch_n_rows_with_columns(n=10):
     """
     Fetch n rows from the configured table using existing DB utilities.
@@ -208,7 +201,6 @@ def fetch_n_rows_with_columns(n=10):
         if conn:
             conn.close()
             print("🔌 Database connection closed.")
-
 
 def fetch_n_rows_with_columns(n=10):
     """
@@ -275,8 +267,6 @@ def fetch_face_records(batch_size=5000):
     finally:
         conn.close()
         print("🔌 Database connection closed.")
-
-
 
 def get_image_row_by_filesrno(file_srno, image_base_path):
     """
@@ -365,21 +355,121 @@ def get_image_row_by_filesrno(file_srno, image_base_path):
         "image_base64": base64_image
     }
 
+    with open("output.txt", "w", encoding="utf-8") as f:
+        f.write(json.dumps(response, indent=4, ensure_ascii=False))
+    return response
+
+import os
+import shutil
+import json
+import base64
+import pymysql
+from utils.db_utils import get_connection
+
+
+def get_image_row_by_filesrno_new(file_srno, image_base_path):
+    """
+    Fetch DB row using FILE_SRNO (no filters)
+    Save image BLOB locally
+    Convert saved image to Base64
+    Return clean response dictionary
+    """
+
+    conn = get_connection()
+
+    # -------------------------------------------------------------
+    # 1️⃣ Clear image folder
+    # -------------------------------------------------------------
+    if os.path.exists(image_base_path):
+        shutil.rmtree(image_base_path)
+    os.makedirs(image_base_path, exist_ok=True)
+
+    # -------------------------------------------------------------
+    # 2️⃣ Query WITHOUT FILTERS
+    # -------------------------------------------------------------
+    query = """
+        SELECT
+            taf.ACCUSED_FILE_SRNO AS FILE_SRNO,
+            tai.ACCUSED_SRNO,
+            taf.FILE_NAME,
+            CONCAT(tai.FIRST_NAME, ' ', tai.LAST_NAME) AS ACCUSED_NAME,
+            tai.RELATIVE_NAME,
+            tai.AGE,
+            mg.GENDER,
+            CONCAT(SUBSTR(tfr.FIR_REG_NUM, -4), '/', tfr.REG_YEAR) AS FIR_REG_NUM,
+            taf.UPLOADED_FILE
+        FROM t_accused_info tai
+        JOIN t_fir_registration tfr ON tai.fir_reg_num = tfr.fir_reg_num
+        JOIN t_accused_files taf ON taf.ACCUSED_SRNO = tai.ACCUSED_SRNO
+        LEFT JOIN m_gender mg ON tai.GENDER_CD = mg.GENDER_CD AND mg.LANG_CD = 6
+        WHERE taf.ACCUSED_FILE_SRNO = %s;
+    """
+
+    with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+        cursor.execute(query, (file_srno,))
+        rows = cursor.fetchall()
+        if not rows:
+            return {"error": f"No record found for FILE_SRNO={file_srno}"}
+
+    row = rows[0]
+
+    # -------------------------------------------------------------
+    # 3️⃣ Save Image (if exists)
+    # -------------------------------------------------------------
+    image_blob = row.get("UPLOADED_FILE")
+    image_path = None
+    base64_image = None
+
+    if image_blob:
+        file_path = os.path.join(image_base_path, row["FILE_NAME"])
+
+        # Save file
+        try:
+            with open(file_path, "wb") as f:
+                f.write(image_blob)
+            image_path = file_path
+        except Exception:
+            pass
+
+        # Base64 encode
+        try:
+            base64_image = base64.b64encode(image_blob).decode("utf-8")
+        except Exception:
+            base64_image = None
+
+    # -------------------------------------------------------------
+    # 4️⃣ Build clean response
+    # -------------------------------------------------------------
+    response = {
+        "FILE_SRNO": row.get("FILE_SRNO"),
+        "ACCUSED_SRNO": row.get("ACCUSED_SRNO"),
+        "FILE_NAME": row.get("FILE_NAME"),
+        "ACCUSED_NAME": row.get("ACCUSED_NAME"),
+        "RELATIVE_NAME": row.get("RELATIVE_NAME"),
+        "AGE": row.get("AGE"),
+        "GENDER": row.get("GENDER"),
+        "FIR_REG_NUM": row.get("FIR_REG_NUM"),
+        "image_path": image_path,
+        "image_base64": base64_image
+    }
+
+    # Debug output
+    with open("output.txt", "w", encoding="utf-8") as f:
+        f.write(json.dumps(response, indent=4, ensure_ascii=False))
+
     return response
 
 
-
-
-
-
-
 # conn = get_connection()
-# file_srno = int("333010102500007172")
+# file_srno = int("333030062500004592")
+# file_srno = int("3330100123000172601")
+
 # image_base_path = "temp_images"
-# row_data = get_image_row_by_filesrno(conn, file_srno=file_srno, image_base_path=image_base_path)
-# with open("output.txt", "w", encoding="utf-8") as f:
-#     f.write(json.dumps(row_data, indent=4, ensure_ascii=False))
-# print(row_data.get("image_base64"))
+# row_data = get_image_row_by_filesrno_new(file_srno=file_srno, image_base_path=image_base_path)
+# # # with open("output.txt", "w", encoding="utf-8") as f:
+# # #     f.write(json.dumps(row_data, indent=4, ensure_ascii=False))
+# print(row_data.get("FILE_SRNO"))
+# print(int("3336504423000810801"))
 
 
 

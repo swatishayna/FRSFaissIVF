@@ -17,7 +17,7 @@ from utils.faiss_utils import (
     add_to_faiss_index,
     get_faiss_id_map
 )
-from utils.db_utils import get_image_row_by_filesrno
+from utils.db_utils import get_image_row_by_filesrno_new, get_image_row_by_filesrno
 from utils.extra_utils import save_image_locally, repair_and_log_corrupted_embeddings
 from utils.logger_utils import setup_logger
 
@@ -160,8 +160,6 @@ def extract_multiple_faces(img_bytes: bytes):
     return results
 
 
-
-
 # ---- Startup embedding integrity check ----
 @app.on_event("startup")
 async def check_and_repair_embeddings():
@@ -257,12 +255,6 @@ faiss_index = get_or_build_faiss_index()
 
 # ---- Response Models ----
 class MatchItem(BaseModel):
-    # image_id: str
-    # image_path: str
-    # distance: float
-    # score: Optional[float] = None
-    # below_threshold: bool
-    
     FILE_SRNO: Optional[int] = None
     ACCUSED_SRNO: Optional[int] = None
     FILE_NAME: Optional[str] = None
@@ -393,8 +385,12 @@ async def recognize(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
         #         below_threshold=below_threshold,
         #     )
         # )
+        # print(image_id)
+        print("IDX from FAISS:", idx)
+        print("IMAGE_ID from ID_MAP:", image_id)
 
-        meta = get_image_row_by_filesrno(file_srno = int(image_id), image_base_path = "temp_images")
+        meta = get_image_row_by_filesrno_new(file_srno = int(image_id), image_base_path = "temp_images")
+        print(meta)
 
         # meta = get_metadata(image_id, metadata_csv)
       
@@ -423,8 +419,8 @@ async def recognize(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
 
     return RecognitionResponse(query_image=None, matches=matches)
 
-@app.post("/multi-face-search", response_model=MultiFaceRecognitionResponse)
-async def multi_face_search(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
+@app.post("/multi-face-search_all", response_model=MultiFaceRecognitionResponse)
+async def multi_face_search_all(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
     global faiss_index
 
     contents = await file.read()
@@ -570,6 +566,98 @@ async def multi_face_search(file: UploadFile, top_k: int = Query(5, ge=1, le=50)
         results=all_results
     )
 
+@app.post("/multi-face-search", response_model=MultiFaceRecognitionResponse)
+async def multi_face_search(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
+    global faiss_index
+
+    contents = await file.read()
+
+    # Extract all faces
+    faces = extract_multiple_faces(contents)
+    if not faces:
+        logger.info("No face detected")
+        return MultiFaceRecognitionResponse(total_faces=0, results=[])
+
+    if faiss_index is None:
+        faiss_index = get_or_build_faiss_index()
+
+    id_map = get_faiss_id_map("data/faiss/id_map.json")
+
+    all_results = []
+
+    for face in faces:
+        emb = np.array(face["embedding"], dtype=np.float32).reshape(1, -1)
+
+        distances, indices = search_faiss_index(faiss_index, emb, top_k)
+        distances = distances[0].tolist()
+        indices = indices[0].tolist()
+
+        matches = []
+
+        # -----------------------------------------
+        # STRICT THRESHOLD FILTERING
+        # -----------------------------------------
+        for idx, dist in zip(indices, distances):
+
+            image_id = id_map.get(str(idx))
+            if not image_id:
+                logger.warning(f"Missing id_map entry for FAISS index {idx}")
+                continue
+
+            meta = get_image_row_by_filesrno(
+                file_srno=int(image_id),
+                image_base_path="temp_images"
+            )
+            if not meta:
+                logger.warning(f"No metadata for image_id {image_id}")
+                continue
+
+            path = id_to_image_path(image_id)
+            score = normalize_distance_to_score(dist)
+
+            # Only allow above threshold
+            if score < threshold:
+                continue
+
+            matches.append(
+                MultiMatchItem(
+                    face_id=face["face_id"],
+
+                    FILE_SRNO=meta.get("FILE_SRNO"),
+                    ACCUSED_SRNO=meta.get("ACCUSED_SRNO"),
+                    FILE_NAME=meta.get("FILE_NAME"),
+                    ACCUSED_NAME=meta.get("ACCUSED_NAME"),
+                    RELATIVE_NAME=meta.get("RELATIVE_NAME"),
+                    AGE=meta.get("AGE"),
+                    GENDER=meta.get("GENDER"),
+                    FIR_REG_NUM=meta.get("FIR_REG_NUM"),
+                    IMAGE_PATH=meta.get("image_path"),
+                    IMAGE_BASE64=meta.get("image_base64"),
+
+                    image_id=image_id,
+                    image_path=path,
+                    distance=float(dist),
+                    score=score,
+                    below_threshold=False
+                    
+                )
+            )
+
+        # -----------------------------------------
+        # EVEN IF ZERO MATCHES → RETURN EMPTY FOR THIS FACE
+        # -----------------------------------------
+        all_results.append(
+            FaceSearchResult(
+                face_id=face["face_id"],
+                bbox=face["bbox"],
+                matches=matches
+            )
+        )
+
+    return MultiFaceRecognitionResponse(
+        total_faces=len(faces),
+        results=all_results
+    )
 
 
 @app.post("/add_image")

@@ -188,8 +188,6 @@ def drop_duplicate_rows(filepath, unique_cols):
     except Exception as e:
         print(f"❌ Error cleaning {filepath}: {e}")
 
-import os
-import pandas as pd
 
 def load_already_processed(METADATA_PATH, FAILED_METADATA_PATH):
     processed = set()
@@ -217,3 +215,35 @@ def load_already_processed(METADATA_PATH, FAILED_METADATA_PATH):
 
     print(f"✔ Loaded processed FILE_SRNO count: {len(processed)}")
     return processed
+
+from PIL import Image
+
+def combine_horizontal(img1_path, img2_path, img3_path, output_path):
+    img1 = Image.open(img1_path)
+    img2 = Image.open(img2_path)
+    img3 = Image.open(img3_path)
+
+    # Match heights by resizing (optional)
+    height = max(img1.height, img2.height, img3.height)
+
+    img1 = img1.resize((int(img1.width * height / img1.height), height))
+    img2 = img2.resize((int(img2.width * height / img2.height), height))
+    img3 = img3.resize((int(img3.width * height / img3.height), height))
+
+    # Create combined image
+    total_width = img1.width + img2.width + img3.width
+    combined = Image.new("RGB", (total_width, height))
+
+    combined.paste(img1, (0, 0))
+    combined.paste(img2, (img1.width, 0))
+    combined.paste(img3, (img1.width + img2.width, 0))
+
+    combined.save(output_path)
+    print("Saved:", output_path)
+
+
+# path1 = "/root/test/frs_multi/temp_images/333010102500007182.jpg"
+# path2 = "/root/test/frs_multi/temp_images/333010102500007352.jpg"
+# path3 = "/root/test/frs_multi/temp_images/कमल टोंडे.jpeg"
+# combine_horizontal(img1_path = path1, 
+# img2_path=path2, img3_path= path3, output_path= "/root/test/frs_multi/temp_images/output.jpg")

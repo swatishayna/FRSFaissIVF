@@ -1,9 +1,9 @@
 faiss:
   dim: 512       # embedding dimension
-  nlist: 1000    # number of coarse clusters
+  nlist: 1000    
   m: 16          # number of subquantizers
-  nbits: 8       # bits per subvector
-  nprobe: 10     # number of clusters to search
+  nbits: 8       
+  nprobe: 10     
 
 
 logging:

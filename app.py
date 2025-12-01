@@ -1,13 +1,15 @@
 from fastapi import FastAPI, UploadFile, Query
 from pydantic import BaseModel
 from typing import List, Optional
+import base64
 import os
 import numpy as np
 import uvicorn
 import re
 import logging
+import cv2
+from insightface.app import FaceAnalysis
 
-# ---- Your utils ----
 from utils.config_utils import load_config
 from utils.embedding_utils import EmbeddingStore
 from utils.faiss_utils import (
@@ -17,15 +19,9 @@ from utils.faiss_utils import (
     add_to_faiss_index,
     get_faiss_id_map
 )
-from utils.db_utils import get_image_row_by_filesrno_new, get_image_row_by_filesrno
+from utils.db_utils import get_image_row_by_filesrno_check, get_image_row_by_filesrno
 from utils.extra_utils import save_image_locally, repair_and_log_corrupted_embeddings
 from utils.logger_utils import setup_logger
-
-
-from insightface.app import FaceAnalysis
-
-
-
 
 
 # ---- Load config ----
@@ -34,8 +30,6 @@ config = load_config()
 setup_logger(config)
 logger = logging.getLogger(__name__)
 
-
-# faiss_index_path = os.path.join("data", "faiss","faiss.index")
 faiss_index_path = os.path.join("data", "faiss", "faiss_ivf.index")
 metadata_csv = os.path.join("data", "metadata","metadata.csv")
 threshold = float(config.get("threshold", 0.7))
@@ -51,113 +45,80 @@ embedding_path = os.path.join("data","embeddings", "embeddings.npy")
 id_path = os.path.join("data", "embeddings","image_ids.npy")
 embedding_store = EmbeddingStore(embedding_path, id_path)
 
-def get_metadata(image_id: str, metadata_csv: str):
-    import pandas as pd
 
-    if not os.path.exists(metadata_csv):
-        return {}
-
-    try:
-        # Read raw lines (we will fix each row manually)
-        with open(metadata_csv, "r", encoding="utf-8") as f:
-            rows = [line.strip() for line in f.readlines()]
-
-        fixed_rows = []
-        for line in rows:
-            parts = line.split(",")
-
-            # Expected = 10 columns
-            if len(parts) == 10:
-                fixed_rows.append(parts)
-                continue
-
-           
-            if len(parts) > 10:
-                # Fix logic:
-                # FILE_NAME = parts[2]
-                # ACCUSED_NAME = join parts[3:-7]
-                # RELATIVE_NAME = parts[-7]
-                # AGE = parts[-6]
-                # GENDER = parts[-5]
-                # FIR_REG_NUM = parts[-4]
-                # IMAGE_PATH = parts[-3]
-                # TIMESTAMP = parts[-2] or [-1]
-
-                fixed = [
-                    parts[0],                     # FILE_SRNO
-                    parts[1],                     # ACCUSED_SRNO
-                    parts[2],                     # FILE_NAME
-                    ",".join(parts[3:-7]).strip(),# ACCUSED_NAME (merged)
-                    parts[-7],                    # RELATIVE_NAME
-                    parts[-6],                    # AGE
-                    parts[-5],                    # GENDER
-                    parts[-4],                    # FIR_REG_NUM
-                    parts[-3],                    # IMAGE_PATH
-                    parts[-2] if len(parts) > 10 else parts[-1]  # TIMESTAMP
-                ]
-                fixed_rows.append(fixed)
-                continue
-
-            # If fewer columns? pad with empty strings
-            while len(parts) < 10:
-                parts.append("")
-            fixed_rows.append(parts)
-
-        # Convert to DataFrame
-        df = pd.DataFrame(fixed_rows, columns=[
-            "FILE_SRNO",
-            "ACCUSED_SRNO",
-            "FILE_NAME",
-            "ACCUSED_NAME",
-            "RELATIVE_NAME",
-            "AGE",
-            "GENDER",
-            "FIR_REG_NUM",
-            "IMAGE_PATH",
-            "TIMESTAMP"
-        ])
-
-        # Normalize IDs
-        df["FILE_SRNO"] = df["FILE_SRNO"].astype(str).str.strip().str.replace(".0", "")
-
-        clean_id = str(image_id).strip().replace(".0", "")
-
-        row = df[df["FILE_SRNO"] == clean_id]
-
-        if row.empty:
-            print("❌ No match found for:", clean_id)
-            return {}
-
-        return row.iloc[0].to_dict()
-
-    except Exception as e:
-        print("Metadata lookup exception:", e)
-        return {}
-
-def extract_multiple_faces(img_bytes: bytes):
+def extract_multiple_faces_bbox(img_bytes: bytes):
     """
-    Returns list of dicts:
-    [{ 'face_id': i, 'bbox': [x1,y1,x2,y2], 'embedding': np.array }, ...]
+    Detects multiple faces, draws bounding boxes + face_id,
+    saves image as bbox.jpg, and returns:
+    - results list
+    - base64 annotated image
     """
-    import cv2
-    import numpy as np
 
+    # -----------------------------
+    # 1️⃣ Delete existing bbox.jpg
+    # -----------------------------
+    output_path = "bbox.jpg"
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    # -----------------------------
+    # 2️⃣ Read image from bytes
+    # -----------------------------
     np_arr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
     faces = face_app.get(img)
     results = []
 
+    # If no faces, return immediately
+    if not faces:
+        return [], None
+
+    # -----------------------------
+    # 3️⃣ Draw bounding boxes + face_id
+    # -----------------------------
     for i, f in enumerate(faces):
         x1, y1, x2, y2 = map(int, f.bbox)
 
+        # Append result structure
         results.append({
             "face_id": i + 1,
             "bbox": [x1, y1, x2, y2],
             "embedding": f.normed_embedding
         })
 
-    return results
+        # Draw bounding box (green)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # Put face_id text at top-right
+        text = f"ID: {i+1}"
+
+        # Ensure text is inside image
+        text_x = max(x2 - 70, 0)
+        text_y = max(y1 + 20, 20)
+
+        cv2.putText(
+            img,
+            text,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2
+        )
+
+    # -----------------------------
+    # 4️⃣ Save annotated image
+    # -----------------------------
+    cv2.imwrite(output_path, img)
+
+    # -----------------------------
+    # 5️⃣ Convert annotated image → base64
+    # -----------------------------
+    _, buffer = cv2.imencode('.jpg', img)
+    bbox_base64 = base64.b64encode(buffer).decode("utf-8")
+
+    return results, bbox_base64
 
 
 # ---- Startup embedding integrity check ----
@@ -190,7 +151,6 @@ face_app = FaceAnalysis(name=config.get("face_model", "buffalo_l"))
 face_app.prepare(ctx_id=0, det_size=(640, 640))
 print("✅ Face model loaded successfully.")
 
-
 def get_embedding_from_bytes(img_bytes: bytes) -> Optional[np.ndarray]:
     """
     Generate a 512-d face embedding from image bytes.
@@ -207,26 +167,6 @@ def get_embedding_from_bytes(img_bytes: bytes) -> Optional[np.ndarray]:
         return None
 
     return faces[0].normed_embedding
-
-
-# ---- FAISS Index Management ----
-# def get_or_build_faiss_index():
-#     """Load existing FAISS index or build a new one from embeddings."""
-#     if os.path.exists(faiss_index_path):
-#         return load_faiss_index(
-#             faiss_index_path, faiss_config={"dimension": faiss_cfg.get("dim", 512)}
-#         )
-
-#     if embedding_store.embeddings is None or embedding_store.embeddings.shape[0] == 0:
-#         return None  # No embeddings yet
-
-#     index = load_faiss_index(
-#         faiss_index_path, faiss_config={"dimension": faiss_cfg.get("dim", 512)}
-#     )
-#     emb = np.array(embedding_store.embeddings, dtype=np.float32)
-#     add_to_faiss_index(index, emb)
-#     save_faiss_index(index, faiss_index_path)
-#     return index
 
 def get_or_build_faiss_index():
     """Load or create FAISS IVF index, and train if needed."""
@@ -254,6 +194,10 @@ def get_or_build_faiss_index():
 faiss_index = get_or_build_faiss_index()
 
 # ---- Response Models ----
+class Base64Response(BaseModel):
+    filename: Optional[str] = None
+    base64_string: Optional[str] = None
+
 class MatchItem(BaseModel):
     FILE_SRNO: Optional[int] = None
     ACCUSED_SRNO: Optional[int] = None
@@ -264,21 +208,17 @@ class MatchItem(BaseModel):
     GENDER: Optional[str] = None
     FIR_REG_NUM: Optional[str] = None
     IMAGE_PATH: Optional[str] = None
-    IMAGE_BASE64: Optional[str] = None
+    DISTRICT: Optional[str] = None
+    POLICE_STATION: Optional[str] = None
 
     image_id: str
     image_path: str
     distance: float
     score: Optional[float] = None
     below_threshold: bool
+    IMAGE_BASE64: Optional[str] = None
 
 class MultiMatchItem(BaseModel):
-    # image_id: str
-    # image_path: str
-    # distance: float
-    # score: Optional[float] = None
-    # below_threshold: bool
-
     face_id: Optional[int] = None
     FILE_SRNO: Optional[int] = None
     ACCUSED_SRNO: Optional[int] = None
@@ -289,15 +229,19 @@ class MultiMatchItem(BaseModel):
     GENDER: Optional[str] = None
     FIR_REG_NUM: Optional[str] = None
     IMAGE_PATH: Optional[str] = None
-    IMAGE_BASE64: Optional[str] = None
-
+    DISTRICT: Optional[str] = None
+    POLICE_STATION: Optional[str] = None
+    
     image_id: str
     image_path: str
     distance: float
     score: Optional[float] = None
     below_threshold: bool
+    IMAGE_BASE64: Optional[str] = None
 
-
+class Base64ImageInput(BaseModel):
+    image_base64: str
+    top_k: int = 5
 
 class RecognitionResponse(BaseModel):
     query_image: Optional[str]
@@ -308,12 +252,11 @@ class FaceSearchResult(BaseModel):
     bbox: List[int]
     matches: List[MultiMatchItem]
 
-
 class MultiFaceRecognitionResponse(BaseModel):
     total_faces: int
+    bbox_base64: Optional[str]=None
     results: List[FaceSearchResult]
 
-# ---- Helper Functions ----
 def id_to_image_path(image_id: str) -> str:
     """Resolve image_id to actual image path."""
     for ext in [".jpg", ".png"]:
@@ -322,24 +265,58 @@ def id_to_image_path(image_id: str) -> str:
             return candidate
     return os.path.join(image_folder, f"{image_id}.jpg")  # fallback
 
-
 def normalize_distance_to_score(dist: float) -> float:
     """Convert L2 distance to similarity score [0, 1]."""
     max_dist = 4.0
     s = 1.0 - min(dist, max_dist) / max_dist
     return float(max(0.0, min(1.0, s)))
 
-
-# ---- Routes ----
-@app.post("/recognize", response_model=RecognitionResponse)
-async def recognize(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
+@app.post("/file-to-base64", response_model=Base64Response)
+async def file_to_base64(file: UploadFile):
     """
-    Upload a face image and get top_k nearest matches from existing data/images.
+    Accepts an image file and converts it to Base64 string.
+    Works for JPG, PNG, JPEG.
+    """
+
+    # Read file bytes
+    contents = await file.read()
+
+    # Convert to Base64
+    base64_str = base64.b64encode(contents).decode("utf-8")
+
+    # Optionally add header (remove if not needed)
+    mime_type = file.content_type  # e.g., image/jpeg
+    base64_with_header = f"data:{mime_type};base64,{base64_str}"
+
+    return Base64Response(
+        filename=file.filename,
+
+        base64_string=base64_str
+    )
+
+@app.post("/recognize", response_model=RecognitionResponse)
+async def recognize(payload: Base64ImageInput):
+    """
+    Upload a face image base64 and get top_k nearest matches from existing data/images.
     """
     global faiss_index
 
-    contents = await file.read()
-    print(f"📸 Received file: {file.filename}, size={len(contents)} bytes")
+    
+    # 1️⃣ Extract & decode Base64
+    base64_string = payload.image_base64
+    top_k = payload.top_k
+
+    if "," in base64_string:  
+        base64_string = base64_string.split(",")[1]  
+
+    try:
+        contents = base64.b64decode(base64_string)
+    except Exception:
+        print("🚫 Invalid Base64 format")
+        return RecognitionResponse(query_image=None, matches=[])
+
+    print(f"📸 Received base64 image, size={len(contents)} bytes")
+
     embedding = get_embedding_from_bytes(contents)
     if embedding is None:
         print("🚫 No face detected in the image.")
@@ -361,11 +338,7 @@ async def recognize(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
     distances, indices = distances[0].tolist(), indices[0].tolist()
 
     matches = []
-    # for idx, dist in zip(indices, distances):
-    #     if idx < 0 or idx >= embedding_store.image_ids.shape[0]:
-    #         continue
-    #     image_id = str(embedding_store.image_ids[idx])
-    #     path = id_to_image_path(image_id)
+    
     id_map = get_faiss_id_map("data/faiss/id_map.json")
 
     for idx, dist in zip(indices, distances):
@@ -376,23 +349,14 @@ async def recognize(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
         path = id_to_image_path(image_id)
         score = normalize_distance_to_score(float(dist))
         below_threshold = score >= (1.0 - threshold)
-        # matches.append(
-        #     MatchItem(
-        #         image_id=image_id,
-        #         image_path=path,
-        #         distance=float(dist),
-        #         score=score,
-        #         below_threshold=below_threshold,
-        #     )
-        # )
-        # print(image_id)
+       
         print("IDX from FAISS:", idx)
         print("IMAGE_ID from ID_MAP:", image_id)
 
-        meta = get_image_row_by_filesrno_new(file_srno = int(image_id), image_base_path = "temp_images")
+        meta = get_image_row_by_filesrno_check(file_srno = int(image_id), image_base_path = "temp_images")
         print(meta)
 
-        # meta = get_metadata(image_id, metadata_csv)
+        
       
 
         matches.append(
@@ -406,174 +370,45 @@ async def recognize(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
                 GENDER=meta.get("GENDER"),
                 FIR_REG_NUM=meta.get("FIR_REG_NUM"),
                 IMAGE_PATH=meta.get("image_path"),
-                IMAGE_BASE64= meta.get("image_base64"),
+                DISTRICT = meta.get("DISTRICT"),
+                POLICE_STATION = meta.get("POLICE_STATION"),
+
+                
 
                 image_id=image_id,
                 image_path=path,
                 distance=float(dist),
                 score=score,
                 below_threshold=below_threshold,
+                IMAGE_BASE64= meta.get("image_base64")
             )
         )
 
 
     return RecognitionResponse(query_image=None, matches=matches)
 
-@app.post("/multi-face-search_all", response_model=MultiFaceRecognitionResponse)
-async def multi_face_search_all(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
-    global faiss_index
-
-    contents = await file.read()
-
-    # Extract all faces
-    faces = extract_multiple_faces(contents)
-    if not faces:
-        logger.info("No face detected")
-        return MultiFaceRecognitionResponse(total_faces=0, results=[])
-
-    if faiss_index is None:
-        faiss_index = get_or_build_faiss_index()
-
-    id_map = get_faiss_id_map("data/faiss/id_map.json")
-
-    all_results = []
-
-    for face in faces:
-        emb = np.array(face["embedding"], dtype=np.float32).reshape(1, -1)
-
-        # Search
-        distances, indices = search_faiss_index(faiss_index, emb, top_k)
-        distances, indices = distances[0].tolist(), indices[0].tolist()
-
-        matches = []
-
-        # -----------------------------------------
-        # 1️⃣ FIRST PASS — apply threshold normally
-        # -----------------------------------------
-        for idx, dist in zip(indices, distances):
-
-            image_id = id_map.get(str(idx))
-            if not image_id:
-                logger.warning(f"⚠️ Missing id_map entry for FAISS index {idx}")
-                continue  # skip safely
-
-            meta = get_image_row_by_filesrno(
-                file_srno=int(image_id),
-                image_base_path="temp_images"
-            )
-
-            # If DB returns None → skip safely
-            if not meta:
-                logger.warning(f"⚠️ Metadata missing for image_id {image_id}")
-                continue
-
-            path = id_to_image_path(image_id)
-
-            score = normalize_distance_to_score(dist)
-            below_threshold = score >= (1.0 - threshold)
-
-            # Only add if above threshold
-            if below_threshold:
-                matches.append(
-                    MultiMatchItem(
-                        FILE_SRNO=meta.get("FILE_SRNO"),
-                        ACCUSED_SRNO=meta.get("ACCUSED_SRNO"),
-                        FILE_NAME=meta.get("FILE_NAME"),
-                        ACCUSED_NAME=meta.get("ACCUSED_NAME"),
-                        RELATIVE_NAME=meta.get("RELATIVE_NAME"),
-                        AGE=meta.get("AGE"),
-                        GENDER=meta.get("GENDER"),
-                        FIR_REG_NUM=meta.get("FIR_REG_NUM"),
-                        IMAGE_PATH=meta.get("image_path"),
-                        IMAGE_BASE64=meta.get("image_base64"),
-
-                        image_id=image_id,
-                        image_path=path,
-                        distance=float(dist),
-                        score=score,
-                        below_threshold=below_threshold
-                    )
-                )
-
-        # -----------------------------------------
-        # 2️⃣ SECOND PASS — If matches < top_k → fill by LOWEST threshold
-        # -----------------------------------------
-        if len(matches) < top_k:
-            need = top_k - len(matches)
-
-            backup_results = []
-            for idx, dist in zip(indices, distances):
-                if len(backup_results) >= need:
-                    break
-
-                image_id = id_map.get(str(idx))
-                if not image_id:
-                    continue
-
-                meta = get_image_row_by_filesrno(
-                    file_srno=int(image_id),
-                    image_base_path="temp_images"
-                )
-                if not meta:
-                    continue
-
-                path = id_to_image_path(image_id)
-                score = normalize_distance_to_score(dist)
-
-                backup_results.append(
-                    MultiMatchItem(
-                        FILE_SRNO=meta.get("FILE_SRNO"),
-                        ACCUSED_SRNO=meta.get("ACCUSED_SRNO"),
-                        FILE_NAME=meta.get("FILE_NAME"),
-                        ACCUSED_NAME=meta.get("ACCUSED_NAME"),
-                        RELATIVE_NAME=meta.get("RELATIVE_NAME"),
-                        AGE=meta.get("AGE"),
-                        GENDER=meta.get("GENDER"),
-                        FIR_REG_NUM=meta.get("FIR_REG_NUM"),
-                        IMAGE_PATH=meta.get("image_path"),
-                        IMAGE_BASE64=meta.get("image_base64"),
-
-                        image_id=image_id,
-                        image_path=path,
-                        distance=float(dist),
-                        score=score,
-                        below_threshold=False  # low-confidence
-                    )
-                )
-
-            matches.extend(backup_results)
-
-        # -----------------------------------------
-        # LABEL EACH FACE AS Person1, Person2, etc.
-        # -----------------------------------------
-        person_label = f"Person{face['face_id']}"
-
-        enriched_results = []
-        for m in matches:
-            m.face_id = person_label
-            enriched_results.append(m)
-
-        all_results.append(
-            FaceSearchResult(
-                face_id=face["face_id"],
-                bbox=face["bbox"],
-                matches=enriched_results
-            )
-        )
-
-    return MultiFaceRecognitionResponse(
-        total_faces=len(faces),
-        results=all_results
-    )
-
 @app.post("/multi-face-search", response_model=MultiFaceRecognitionResponse)
-async def multi_face_search(file: UploadFile, top_k: int = Query(5, ge=1, le=50)):
+async def multi_face_search(payload: Base64ImageInput):
     global faiss_index
 
-    contents = await file.read()
+    # contents = await file.read()
+    # 1️⃣ Extract & decode Base64
+    base64_string = payload.image_base64
+    top_k = payload.top_k
+
+    if "," in base64_string:  
+        base64_string = base64_string.split(",")[1]  
+
+    try:
+        contents = base64.b64decode(base64_string)
+    except Exception:
+        print("🚫 Invalid Base64 format")
+        return RecognitionResponse(query_image=None, matches=[])
+
+    print(f"📸 Received base64 image, size={len(contents)} bytes")
 
     # Extract all faces
-    faces = extract_multiple_faces(contents)
+    faces, bbox_base64 = extract_multiple_faces_bbox(contents)
     if not faces:
         logger.info("No face detected")
         return MultiFaceRecognitionResponse(total_faces=0, results=[])
@@ -604,7 +439,7 @@ async def multi_face_search(file: UploadFile, top_k: int = Query(5, ge=1, le=50)
                 logger.warning(f"Missing id_map entry for FAISS index {idx}")
                 continue
 
-            meta = get_image_row_by_filesrno(
+            meta = get_image_row_by_filesrno_check(
                 file_srno=int(image_id),
                 image_base_path="temp_images"
             )
@@ -632,13 +467,16 @@ async def multi_face_search(file: UploadFile, top_k: int = Query(5, ge=1, le=50)
                     GENDER=meta.get("GENDER"),
                     FIR_REG_NUM=meta.get("FIR_REG_NUM"),
                     IMAGE_PATH=meta.get("image_path"),
-                    IMAGE_BASE64=meta.get("image_base64"),
+                    DISTRICT = meta.get("DISTRICT"),
+                    POLICE_STATION = meta.get("POLICE_STATION"),
+                    
 
                     image_id=image_id,
                     image_path=path,
                     distance=float(dist),
                     score=score,
-                    below_threshold=False
+                    below_threshold=False,
+                    IMAGE_BASE64=meta.get("image_base64")
                     
                 )
             )
@@ -656,9 +494,9 @@ async def multi_face_search(file: UploadFile, top_k: int = Query(5, ge=1, le=50)
 
     return MultiFaceRecognitionResponse(
         total_faces=len(faces),
+        bbox_base64 = bbox_base64,
         results=all_results
     )
-
 
 @app.post("/add_image")
 async def add_image(file: UploadFile, image_id: str):
@@ -693,7 +531,6 @@ async def add_image(file: UploadFile, image_id: str):
     add_to_faiss_index(faiss_index, emb_arr)
     save_faiss_index(faiss_index, faiss_index_path)
     return {"status": "success", "image_id": image_id}
-
 
 @app.get("/info")
 def info():
